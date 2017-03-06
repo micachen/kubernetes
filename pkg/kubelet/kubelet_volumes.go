@@ -19,7 +19,8 @@ package kubelet
 import (
 	"fmt"
 	"os"
-
+	"os/exec"
+	
 	"github.com/golang/glog"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -114,10 +115,38 @@ func (kl *Kubelet) cleanupOrphanedPodDirs(
 			glog.Errorf("Orphaned pod %q found, but volume paths are still present on disk.", uid)
 			continue
 		}
-		glog.V(3).Infof("Orphaned pod %q found, removing", uid)
-		if err := os.RemoveAll(kl.getPodDir(uid)); err != nil {
-			glog.Errorf("Failed to remove orphaned pod %q dir; err: %v", uid, err)
+		//We want to clean any possible mounts that still exist on a subpath of the orphan'ed pod's path,
+		//lets leverage the shell.
+		//sudo umount -d -v `mount | grep "$parent path" | cut -d \  -f 3
+		//counter=0
+		//for  m in $( mount| grep $substring | awk '{print $3}' ); do 
+		//    echo Unmounting $m
+		//    sudo umount $m
+		//    counter=$[counter + 1]
+		//done
+		//echo "cleaned $counter mounts"
+		
+		dirToClean := kl.getPodDir(uid)
+		cmd := exec.Command("/bin/bash", "-c", fmt.Sprint("counter=0;for m in $( mount|grep ",dirToClean," | awk '{print $3}' ); do echo Unmounting $m; sudo umount $m; counter=$(($counter + 1)); done; echo cleaned $counter mounts"))
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		err := cmd.Run()
+		if err != nil {
+			// If there are errors from the previous command, there still might be mounted subdirectories
+			// for the pod it is extremely dangerous to perform a os.RemoveAll on the directory
+			// you can easily wipe a whole NFS volume clean.  So here we choose to leave the path orphaned.
+			glog.Infof("Failed to unmount mounted subdirectories pod %q; err: %v", uid, err)
 			errlist = append(errlist, err)
+		} else {
+			//When there were no errors, the path should have no mounts anywhere in it's tree.
+			//Safe to recursively delete.
+			glog.V(3).Infof("Removing Mounts for Pod %q: %q\n", uid, out.String())
+
+			glog.V(3).Infof("Orphaned pod %q found, removing", uid)
+			if err := os.RemoveAll(kl.getPodDir(uid)); err != nil {
+				glog.Infof("Failed to remove orphaned pod %q dir; err: %v", uid, err)
+				errlist = append(errlist, err)
+			}
 		}
 	}
 	return utilerrors.NewAggregate(errlist)
